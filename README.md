@@ -62,10 +62,43 @@ This avoids tool name collisions across providers.
 
 ## Installation
 
+### Quick Install (Recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sourceplane/thin/main/install.sh | bash
+```
+
+This script automatically detects your OS and architecture, downloads the latest release, and installs it to `/usr/local/bin`.
+
 ### Homebrew
 
 ```bash
 brew install sourceplane/tap/thin
+```
+
+### Manual Release Download
+
+Download the latest release for your platform:
+
+```bash
+# macOS (Apple Silicon)
+curl -L https://github.com/sourceplane/thin/releases/latest/download/thin_darwin_arm64.tar.gz | tar xz
+
+# macOS (Intel)
+curl -L https://github.com/sourceplane/thin/releases/latest/download/thin_darwin_x86_64.tar.gz | tar xz
+
+# Linux (x86_64)
+curl -L https://github.com/sourceplane/thin/releases/latest/download/thin_linux_x86_64.tar.gz | tar xz
+
+# Linux (ARM64)
+curl -L https://github.com/sourceplane/thin/releases/latest/download/thin_linux_arm64.tar.gz | tar xz
+```
+
+Move the binary to your PATH:
+
+```bash
+sudo mv thin /usr/local/bin/
+chmod +x /usr/local/bin/thin
 ```
 
 ### From Source
@@ -74,31 +107,7 @@ brew install sourceplane/tap/thin
 git clone https://github.com/sourceplane/thin.git
 cd thin
 go build -o thin .
-```
-
-### Using Releases
-
-Download the latest release for your platform:
-
-```bash
-# macOS (Apple Silicon)
-curl -L https://github.com/sourceplane/thin/releases/download/latest/thin_darwin_arm64.tar.gz | tar xz
-
-# macOS (Intel)
-curl -L https://github.com/sourceplane/thin/releases/download/latest/thin_darwin_x86_64.tar.gz | tar xz
-
-# Linux (x86_64)
-curl -L https://github.com/sourceplane/thin/releases/download/latest/thin_linux_x86_64.tar.gz | tar xz
-
-# Linux (ARM64)
-curl -L https://github.com/sourceplane/thin/releases/download/latest/thin_linux_arm64.tar.gz | tar xz
-```
-
-Move the binary to your PATH:
-
-```bash
 sudo mv thin /usr/local/bin/
-chmod +x /usr/local/bin/thin
 ```
 
 ---
