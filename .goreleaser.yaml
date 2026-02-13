@@ -1,4 +1,4 @@
-version: 2
+version: 1
 
 project_name: thin
 
@@ -8,8 +8,7 @@ before:
     - go mod tidy
 
 builds:
-  - id: thin
-    main: main.go
+  - main: main.go
     binary: thin
     env:
       - CGO_ENABLED=0
