@@ -73,8 +73,13 @@ This script automatically detects your OS and architecture, downloads the latest
 ### Homebrew
 
 ```bash
-brew install sourceplane/tap/thin
+brew tap sourceplane/sourceplane
+brew install sourceplane/sourceplane/thin
 ```
+
+`thin` is published to the Homebrew tap repo:
+
+- https://github.com/sourceplane/homebrew-sourceplane
 
 ### Manual Release Download
 
