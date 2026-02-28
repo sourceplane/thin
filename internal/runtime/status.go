@@ -59,9 +59,9 @@ func (h *TextStatusHandler) OnNodeDownloading(desc ocispec.Descriptor) {
 
 	digestStr := desc.Digest.String()[:16]
 	h.progress[digestStr] = &NodeProgress{
-		Descriptor: desc,
-		Status:     "Downloading",
-		StartTime:  time.Now(),
+		Descriptor:  desc,
+		Status:      "Downloading",
+		StartTime:   time.Now(),
 		DisplaySize: formatBytes(desc.Size),
 	}
 
@@ -76,9 +76,10 @@ func (h *TextStatusHandler) OnNodeDownloaded(desc ocispec.Descriptor) {
 	if p, ok := h.progress[digestStr]; ok {
 		p.Status = "Downloaded"
 		p.EndTime = time.Now()
+		p.BytesRead = desc.Size
 		duration := p.EndTime.Sub(p.StartTime)
-		speed := formatBytesPerSec(float64(p.BytesRead) / duration.Seconds())
-		fmt.Printf("✓ Pulled %s (%s/s)\n", digestStr, speed)
+		speed := formatBytesPerSec(float64(desc.Size) / duration.Seconds())
+		fmt.Printf("✓ Pulled %s %s (%s/s)\n", digestStr, formatBytes(desc.Size), speed)
 	}
 }
 
@@ -130,15 +131,14 @@ func (h *TextStatusHandler) Close() {
 // TTYStatusHandler displays real-time progress with visual elements (TTY)
 // Uses ANSI codes for animated progress bars and status updates matching ORAS CLI
 type TTYStatusHandler struct {
-	mu          sync.Mutex
-	startTime   time.Time
-	progress    map[string]*NodeProgress
-	ticker      *time.Ticker
-	done        chan struct{}
-	wg          sync.WaitGroup
-	currentNode string
-	spinnerIdx  int64
-	lastRender  time.Time
+	mu         sync.Mutex
+	startTime  time.Time
+	progress   map[string]*NodeProgress
+	ticker     *time.Ticker
+	done       chan struct{}
+	wg         sync.WaitGroup
+	spinnerIdx int64
+	lastRender time.Time
 }
 
 // NewTTYStatusHandler creates a TTY-based status handler with real-time progress
@@ -174,66 +174,52 @@ func (h *TTYStatusHandler) render() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Only render the current downloading node
-	if h.currentNode == "" {
+	// Find the best actively-downloading node to render
+	var p *NodeProgress
+	var bestSize int64
+	for _, np := range h.progress {
+		if np.Status == "Downloading" && np.Descriptor.Size > bestSize {
+			p = np
+			bestSize = np.Descriptor.Size
+		}
+	}
+	if p == nil {
 		return
-	}
-
-	p, ok := h.progress[h.currentNode]
-	if !ok || p.Status != "Downloading" {
-		return
-	}
-
-	// Calculate progress
-	progress := float64(p.BytesRead) / float64(p.Descriptor.Size)
-	if progress > 1.0 {
-		progress = 1.0
-	}
-
-	// Calculate speed
-	elapsed := time.Since(p.StartTime).Seconds()
-	speed := 0.0
-	if elapsed > 0 {
-		speed = float64(p.BytesRead) / elapsed
 	}
 
 	// Generate spinner symbol
 	spinIdx := atomic.AddInt64(&h.spinnerIdx, 1)
 	spinnerChar := string(spinnerSymbols[int(spinIdx)%len(spinnerSymbols)])
 
-	// Generate progress bar
-	barLength := 20
-	filledLength := int(progress * float64(barLength))
-	emptyLength := barLength - filledLength
-	progressBar := "["
-	progressBar += strings.Repeat("=", filledLength)
-	progressBar += strings.Repeat(" ", emptyLength)
-	progressBar += "]"
+	// Calculate progress from BytesRead (if available) or show indeterminate
+	elapsed := time.Since(p.StartTime)
+	elapsedTime := formatDuration(elapsed)
 
-	// Format percentage
-	percent := fmt.Sprintf("%.2f%%", progress*100)
-
-	// Format size/total and speed
-	read := formatBytes(p.BytesRead)
-	total := p.DisplaySize
-	speedStr := formatBytesPerSec(speed)
-
-	// Format elapsed time
-	elapsedTime := formatDuration(time.Since(p.StartTime))
-
-	// Render line: [spinner] [bar] [speed] [size/total] [percent] [time]
-	// Abbreviated to fit terminal: ⠋ [==        ] 512KB/s 1.2MB/2.5MB  48% 1m23s
-	output := fmt.Sprintf("\r  %s %s %8s %s/%s %6s %8s",
-		spinnerChar,
-		progressBar,
-		speedStr,
-		read,
-		total,
-		percent,
-		elapsedTime)
-
-	// Write with carriage return to overwrite line
-	fmt.Print(output)
+	if p.BytesRead > 0 && p.Descriptor.Size > 0 {
+		progress := float64(p.BytesRead) / float64(p.Descriptor.Size)
+		if progress > 1.0 {
+			progress = 1.0
+		}
+		barLength := 20
+		filledLength := int(progress * float64(barLength))
+		emptyLength := barLength - filledLength
+		progressBar := "[" + strings.Repeat("=", filledLength) + strings.Repeat(" ", emptyLength) + "]"
+		speed := 0.0
+		if elapsed.Seconds() > 0 {
+			speed = float64(p.BytesRead) / elapsed.Seconds()
+		}
+		output := fmt.Sprintf("\r  %s %s %8s %s/%s %5.1f%% %8s",
+			spinnerChar, progressBar,
+			formatBytesPerSec(speed),
+			formatBytes(p.BytesRead), p.DisplaySize,
+			progress*100, elapsedTime)
+		fmt.Print(output)
+	} else {
+		// Indeterminate: show spinner with size being downloaded
+		output := fmt.Sprintf("\r  %s downloading %s... %8s",
+			spinnerChar, p.DisplaySize, elapsedTime)
+		fmt.Print(output)
+	}
 }
 
 // formatDuration formats duration to human-readable format
@@ -273,7 +259,6 @@ func (h *TTYStatusHandler) OnNodeDownloading(desc ocispec.Descriptor) {
 	defer h.mu.Unlock()
 
 	digestStr := desc.Digest.String()[:16]
-	h.currentNode = digestStr
 	h.progress[digestStr] = &NodeProgress{
 		Descriptor:    desc,
 		Status:        "Downloading",
@@ -295,10 +280,10 @@ func (h *TTYStatusHandler) OnNodeDownloaded(desc ocispec.Descriptor) {
 	if p, ok := h.progress[digestStr]; ok {
 		p.Status = "Downloaded"
 		p.EndTime = time.Now()
+		p.BytesRead = desc.Size
 		duration := p.EndTime.Sub(p.StartTime)
-		speed := formatBytesPerSec(float64(p.BytesRead) / duration.Seconds())
-		// Concise like ORAS: checkmark, size, percentage, time
-		fmt.Printf("✓ Pulled %s (%s/s)\n", digestStr, speed)
+		speed := formatBytesPerSec(float64(desc.Size) / duration.Seconds())
+		fmt.Printf("\r✓ Pulled %s %s (%s/s)\n", digestStr, formatBytes(desc.Size), speed)
 	}
 }
 
@@ -324,7 +309,7 @@ func (h *TTYStatusHandler) OnNodeRestored(desc ocispec.Descriptor) {
 		// Show digest on second line like ORAS
 		fmt.Printf("  └─ sha256:%s\n", desc.Digest.String()[7:])
 	}
-	h.currentNode = "" // Stop rendering for this node
+	// Don't clear currentNode — render() will dynamically find the next active download
 }
 
 func (h *TTYStatusHandler) OnNodeSkipped(desc ocispec.Descriptor) {

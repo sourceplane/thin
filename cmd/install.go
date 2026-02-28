@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/sourceplane/thin/internal/runtime"
 	"github.com/spf13/cobra"
@@ -20,7 +21,8 @@ Example:
 		name := args[0]
 		imageRef := args[1]
 
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
 		if err := runtime.PullProviderOCI(ctx, imageRef, name); err != nil {
 			fmt.Fprintf(cmd.OutOrStderr(), "✗ Failed to install provider: %v\n", err)
 			return err

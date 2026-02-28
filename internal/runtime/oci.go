@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,271 +18,243 @@ import (
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	oras "oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content"
+	"oras.land/oras-go/v2/content/memory"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 )
 
-// PullProviderOCI pulls a provider from an OCI registry and extracts platform-specific files
+// PullProviderOCI pulls a provider from an OCI registry and extracts platform-specific files.
+// Uses oras.Copy for efficient, concurrent layer downloads.
 func PullProviderOCI(ctx context.Context, imageRef string, providerName string) error {
-	// Create provider root directory using provider name
-	// The structure will be: ~/.thin/providers/<name>/
 	providerBaseDir := filepath.Join(ThinHome(), "providers", providerName)
-
 	if err := os.MkdirAll(providerBaseDir, 0755); err != nil {
 		return fmt.Errorf("failed to create provider directory: %w", err)
 	}
 
-	// Create status handler for real-time progress display (ORAS CLI style)
 	handler := NewStatusHandler()
 	defer handler.Close()
 
 	fmt.Printf("Downloading %s from %s...\n", providerName, imageRef)
 
-	// Normalize the image reference if needed
+	// Normalize image reference
 	ref := imageRef
-	if !contains(ref, "/") {
-		// Add default registry
+	if !strings.Contains(ref, "/") {
 		ref = "docker.io/" + ref
 	}
-	if !contains(ref, ":") {
-		// Add default tag
+	if !strings.Contains(ref, ":") && !strings.Contains(ref, "@") {
 		ref = ref + ":latest"
 	}
 
-	fmt.Printf("Using reference: %s\n", ref)
-
-	// Connect to registry with proper HTTP client
+	// Connect to registry
 	repo, err := remote.NewRepository(ref)
 	if err != nil {
 		return fmt.Errorf("failed to parse image reference %s: %w", ref, err)
 	}
 
-	// Set up HTTP client with proper user agent
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			DisableKeepAlives: false,
-		},
-	}
-
-	// Set up auth client for public registries
+	// Optimized HTTP transport — no Client.Timeout (it kills in-flight body reads)
 	repo.Client = &auth.Client{
-		Client: httpClient,
-		Cache:  auth.NewCache(),
+		Client: &http.Client{
+			Transport: &http.Transport{
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          10,
+				MaxIdleConnsPerHost:   4,
+				MaxConnsPerHost:       8,
+				IdleConnTimeout:       30 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				ExpectContinueTimeout: 5 * time.Second,
+				WriteBufferSize:       256 * 1024,
+				ReadBufferSize:        256 * 1024,
+				TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+			},
+		},
+		Cache: auth.NewCache(),
 	}
 
-	fmt.Printf("Connecting to registry...\n")
-
-	// Extract just the tag/digest from ref for Resolve()
-	// ref format is "registry/repo:tag" but Resolve needs just the tag
+	// Extract tag
 	tag := "latest"
-	if idx := lastIndexOf(ref, ":"); idx >= 0 {
+	if idx := strings.LastIndex(ref, ":"); idx >= 0 {
 		tag = ref[idx+1:]
 	}
 
-	// Resolve the reference - must pass the tag or digest, not the full ref
-	desc, err := repo.Resolve(ctx, tag)
-	if err != nil {
-		return fmt.Errorf("failed to resolve image %s with tag %s: %w\nTip: Make sure the image is public or provide credentials", imageRef, tag, err)
+	// Build the set of media types we want for this platform
+	currentOS := runtime.GOOS
+	currentArch := runtime.GOARCH
+	binaryMediaType := fmt.Sprintf("application/vnd.sourceplane.bin.%s-%s", currentOS, currentArch)
+
+	wantedTypes := map[string]bool{
+		"application/vnd.sourceplane.provider.v1": true,
+		"application/vnd.sourceplane.assets.v1":   true,
+		binaryMediaType:                           true,
 	}
 
-	fmt.Printf("✓ Resolved image digest: %s\n", desc.Digest.String()[:16])
+	// Track which layers we actually download for progress display
+	var mu sync.Mutex
+	startTimes := map[string]time.Time{}
 
-	// Fetch the manifest
-	fmt.Printf("Fetching manifest...\n")
-	manifestReader, err := repo.Fetch(ctx, desc)
-	if err != nil {
-		return fmt.Errorf("failed to fetch manifest: %w", err)
+	// In-memory target store for the copy
+	memStore := memory.New()
+
+	// Use oras.Copy — handles manifest resolution, concurrent layer downloads,
+	// deduplication, and streaming in one call
+	copyOpts := oras.CopyOptions{
+		CopyGraphOptions: oras.CopyGraphOptions{
+			Concurrency: 4, // parallel layer downloads
+
+			// Filter to only download platform-relevant layers
+			FindSuccessors: func(ctx context.Context, fetcher content.Fetcher, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+				successors, err := content.Successors(ctx, fetcher, desc)
+				if err != nil {
+					return nil, err
+				}
+
+				// For the manifest node, filter layers to platform-relevant ones
+				if desc.MediaType == ocispec.MediaTypeImageManifest ||
+					desc.MediaType == "application/vnd.oci.image.manifest.v1+json" {
+					var filtered []ocispec.Descriptor
+					foundBinary := false
+					for _, s := range successors {
+						if wantedTypes[s.MediaType] {
+							filtered = append(filtered, s)
+							if s.MediaType == binaryMediaType {
+								foundBinary = true
+							}
+						} else if s.MediaType == ocispec.MediaTypeImageConfig ||
+							s.MediaType == "application/vnd.oci.image.config.v1+json" {
+							// Always include the config
+							filtered = append(filtered, s)
+						}
+						// Skip other platform binaries and empty layers
+					}
+					if !foundBinary {
+						// Fallback: include all non-empty layers for backwards compat
+						fmt.Printf("⚠ No binary for %s/%s, downloading all layers...\n", currentOS, currentArch)
+						filtered = nil
+						for _, s := range successors {
+							if s.MediaType != "application/vnd.oci.empty.v1+json" {
+								filtered = append(filtered, s)
+							}
+						}
+					}
+					if len(filtered) > 0 {
+						fmt.Printf("✓ Fetching %d layers (platform: %s/%s)...\n", len(filtered), currentOS, currentArch)
+					}
+					return filtered, nil
+				}
+				return successors, nil
+			},
+
+			PreCopy: func(ctx context.Context, desc ocispec.Descriptor) error {
+				mu.Lock()
+				startTimes[desc.Digest.String()] = time.Now()
+				mu.Unlock()
+				handler.OnNodeDownloading(desc)
+				return nil
+			},
+
+			PostCopy: func(ctx context.Context, desc ocispec.Descriptor) error {
+				handler.OnNodeDownloaded(desc)
+				return nil
+			},
+
+			OnCopySkipped: func(ctx context.Context, desc ocispec.Descriptor) error {
+				handler.OnNodeSkipped(desc)
+				return nil
+			},
+		},
 	}
-	defer manifestReader.Close()
 
-	manifestData, err := io.ReadAll(manifestReader)
+	fmt.Printf("Pulling from %s...\n", ref)
+	rootDesc, err := oras.Copy(ctx, repo, tag, memStore, tag, copyOpts)
+	if err != nil {
+		return fmt.Errorf("failed to pull image: %w", err)
+	}
+	fmt.Printf("✓ Pulled manifest %s\n", rootDesc.Digest.String()[:16])
+
+	// Now extract the downloaded content from the memory store
+	// Fetch the manifest to find layers
+	manifestRC, err := memStore.Fetch(ctx, rootDesc)
+	if err != nil {
+		return fmt.Errorf("failed to read manifest from store: %w", err)
+	}
+	manifestData, err := io.ReadAll(manifestRC)
+	manifestRC.Close()
 	if err != nil {
 		return fmt.Errorf("failed to read manifest: %w", err)
 	}
 
-	// Parse manifest to get layers
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		return fmt.Errorf("failed to parse manifest: %w", err)
 	}
 
-	// Categorize layers by mediaType
-	currentOS := runtime.GOOS
-	currentArch := runtime.GOARCH
-	
-	var providerLayer *ocispec.Descriptor
-	var assetsLayer *ocispec.Descriptor
-	var binaryLayer *ocispec.Descriptor
-	var layersToDownload []*ocispec.Descriptor
-
-	// Match binary mediaType for current platform: application/vnd.sourceplane.bin.{os}-{arch}
-	binaryMediaType := fmt.Sprintf("application/vnd.sourceplane.bin.%s-%s", currentOS, currentArch)
-
-	for i, layer := range manifest.Layers {
-		switch {
-		case layer.MediaType == "application/vnd.oci.empty.v1+json":
-			// Skip empty config layers
-			continue
-		case layer.MediaType == "application/vnd.sourceplane.provider.v1":
-			providerLayer = &manifest.Layers[i]
-		case layer.MediaType == "application/vnd.sourceplane.assets.v1":
-			assetsLayer = &manifest.Layers[i]
-		case layer.MediaType == binaryMediaType:
-			binaryLayer = &manifest.Layers[i]
-		case strings.HasPrefix(layer.MediaType, "application/vnd.sourceplane.bin."):
-			// Skip other platform binaries (not for current platform)
-			continue
-		default:
-			// Other layers (examples, etc.) - optional, skip for now
+	// Extract each layer from the memory store
+	for _, layer := range manifest.Layers {
+		if layer.MediaType == "application/vnd.oci.empty.v1+json" {
 			continue
 		}
-	}
-
-	// Build layers to download
-	if providerLayer != nil {
-		layersToDownload = append(layersToDownload, providerLayer)
-	}
-	if assetsLayer != nil {
-		layersToDownload = append(layersToDownload, assetsLayer)
-	}
-	if binaryLayer != nil {
-		layersToDownload = append(layersToDownload, binaryLayer)
-	}
-
-	// Check if we found required layers
-	if len(layersToDownload) == 0 {
-		return fmt.Errorf("no compatible provider layers found in manifest")
-	}
-	if providerLayer == nil && assetsLayer == nil {
-		// Provider data (manifest + assets) is required
-		return fmt.Errorf("provider manifest layer not found in manifest")
-	}
-	if binaryLayer == nil {
-		// Try with old structure for backwards compatibility
-		fmt.Printf("⚠ Platform-specific binary layer not found for %s/%s, checking for multi-platform layers...\n", currentOS, currentArch)
-		// Fall back to downloading all layers and filtering during extraction
-		layersToDownload = nil
-		for i := range manifest.Layers {
-			if manifest.Layers[i].MediaType != "application/vnd.oci.empty.v1+json" {
-				layersToDownload = append(layersToDownload, &manifest.Layers[i])
-			}
-		}
-	}
-
-	fmt.Printf("✓ Fetching %d layers (platform: %s/%s)...\n", len(layersToDownload), currentOS, currentArch)
-
-	// Download layer with concurrent workers
-	jobs := make(chan ocispec.Descriptor, len(layersToDownload))
-	results := make(chan layerJob, len(layersToDownload))
-
-	// Start 2 worker goroutines for parallel downloading
-	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for layer := range jobs {
-				handler.OnNodeDownloading(layer)
-
-				// Use tracked fetch to update progress
-				layerData, err := trackedFetchAll(ctx, repo, layer, handler)
-				if err != nil {
-					results <- layerJob{layer: layer, data: nil, err: err}
-					return
-				}
-
-				handler.OnNodeDownloaded(layer)
-				results <- layerJob{layer: layer, data: layerData, err: nil}
-			}
-		}()
-	}
-
-	// Send layers to workers
-	go func() {
-		for _, layer := range layersToDownload {
-			jobs <- *layer
-		}
-		close(jobs)
-	}()
-
-	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Track downloaded layers
-	downloadsCompleted := 0
-
-	// Process results and extract
-	for result := range results {
-		if result.err != nil {
-			return fmt.Errorf("failed to fetch layer %s: %w", result.layer.Digest.String()[:16], result.err)
+		// Only extract layers we wanted (or all if fallback)
+		if !wantedTypes[layer.MediaType] && !strings.HasPrefix(layer.MediaType, "application/vnd.sourceplane.") {
+			continue
 		}
 
-		handler.OnNodeProcessing(result.layer)
+		exists, _ := memStore.Exists(ctx, layer)
+		if !exists {
+			continue // was filtered out
+		}
 
-		// Extract based on layer type
-		if err := extractLayerContent(result.data, providerBaseDir); err != nil {
+		layerData, err := content.FetchAll(ctx, memStore, layer)
+		if err != nil {
+			return fmt.Errorf("failed to read layer %s: %w", layer.Digest.String()[:16], err)
+		}
+		if err := extractLayerContent(layerData, providerBaseDir); err != nil {
 			return fmt.Errorf("failed to extract layer: %w", err)
 		}
-
-		handler.OnNodeRestored(result.layer)
-		downloadsCompleted++
 	}
 
-	// Also handle config blob if present and non-empty
+	// Extract config if non-empty
 	if manifest.Config.Size > 2 {
-		fmt.Printf("✓ Processing config...\n")
-		configData, err := content.FetchAll(ctx, repo, manifest.Config)
-		if err == nil {
-			extractLayerContent(configData, providerBaseDir)
+		if exists, _ := memStore.Exists(ctx, manifest.Config); exists {
+			configData, err := content.FetchAll(ctx, memStore, manifest.Config)
+			if err == nil {
+				extractLayerContent(configData, providerBaseDir)
+			}
 		}
 	}
 
-	// Create necessary subdirectories if they don't exist
+	// Ensure directory structure
 	for _, dir := range []string{"bin", "assets"} {
-		if err := os.MkdirAll(filepath.Join(providerBaseDir, dir), 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", dir, err)
-		}
+		os.MkdirAll(filepath.Join(providerBaseDir, dir), 0755)
 	}
 
-	// If extraction created an oci subdirectory, move contents to root
+	// Relocate oci/ subdirectory if extraction created one
 	ociDir := filepath.Join(providerBaseDir, "oci")
 	if stat, err := os.Stat(ociDir); err == nil && stat.IsDir() {
-		// Move bin and assets from oci to root
 		for _, item := range []string{"bin", "assets"} {
 			src := filepath.Join(ociDir, item)
 			dst := filepath.Join(providerBaseDir, item)
-
-			// Copy contents from src to dst
-			if srcStat, err := os.Stat(src); err == nil {
-				if srcStat.IsDir() {
-					if err := copyDir(src, dst); err == nil {
-						os.RemoveAll(src)
-					}
+			if srcStat, err := os.Stat(src); err == nil && srcStat.IsDir() {
+				if err := copyDir(src, dst); err == nil {
+					os.RemoveAll(src)
 				}
 			}
 		}
-		// Remove empty oci directory
 		os.RemoveAll(ociDir)
 	}
 
-	// Verify manifest exists
+	// Verify provider manifest
 	manifestPath := filepath.Join(providerBaseDir, "thin.provider.yaml")
 	if _, err := os.Stat(manifestPath); err != nil {
 		fmt.Printf("⚠ Warning: provider manifest not found at %s\n", manifestPath)
-		// Don't fail - optional metadata
 	}
 
-	// Verify binary for current platform exists
+	// Verify and chmod binary
 	binPath, err := GetPlatformBinaryPath(providerBaseDir)
 	if err != nil {
 		fmt.Printf("⚠ Warning: %v\n", err)
-		// Don't fail - optional
 	} else {
-		// Make binary executable
 		if err := os.Chmod(binPath, 0755); err != nil {
 			return fmt.Errorf("failed to make binary executable: %w", err)
 		}
@@ -291,47 +264,6 @@ func PullProviderOCI(ctx context.Context, imageRef string, providerName string) 
 	fmt.Printf("✓ Provider %s installed from %s\n", providerName, imageRef)
 	return nil
 }
-
-type progressTracker struct {
-	reader     io.Reader
-	handler    StatusHandler
-	digest     string
-	bytesRead  int64
-	lastUpdate time.Time
-	updateFreq time.Duration
-}
-
-type layerJob struct {
-	layer ocispec.Descriptor
-	data  []byte
-	err   error
-}
-
-func (pt *progressTracker) Read(p []byte) (int, error) {
-	n, err := pt.reader.Read(p)
-	if n > 0 {
-		pt.bytesRead += int64(n)
-
-		// Update handler periodically
-		now := time.Now()
-		if now.Sub(pt.lastUpdate) >= pt.updateFreq {
-			pt.handler.UpdateProgress(pt.digest, pt.bytesRead)
-			pt.lastUpdate = now
-		}
-	}
-	return n, err
-}
-
-// trackedFetchAll fetches layer content with progress tracking
-func trackedFetchAll(ctx context.Context, repo *remote.Repository, layer ocispec.Descriptor, handler StatusHandler) ([]byte, error) {
-	// Use content.FetchAll for the actual fetch
-	data, err := content.FetchAll(ctx, repo, layer)
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
 
 // extractLayerContent extracts tar/tar.gz layer content to target directory
 func extractLayerContent(layerData []byte, targetDir string) error {
@@ -483,27 +415,6 @@ func GetPlatformBinaryPath(providerDir string) (string, error) {
 	return "", fmt.Errorf("binary not found for platform %s/%s (checked bin/entrypoint and bin/%s/%s/entrypoint)", goos, arch, goos, arch)
 }
 
-// contains checks if a string contains a substring
-func contains(s, substr string) bool {
-	for i := 0; i < len(s)-len(substr)+1; i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-// lastIndexOf finds the last occurrence of a substring
-func lastIndexOf(s, substr string) int {
-	last := -1
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			last = i
-		}
-	}
-	return last
-}
-
 // copyDir recursively copies a directory
 func copyDir(src, dst string) error {
 	entries, err := os.ReadDir(src)
@@ -528,13 +439,13 @@ func copyDir(src, dst string) error {
 			if err != nil {
 				return err
 			}
-			
+
 			// Get source file permissions
 			srcInfo, err := os.Stat(srcPath)
 			if err != nil {
 				return err
 			}
-			
+
 			if err := os.WriteFile(dstPath, data, srcInfo.Mode()); err != nil {
 				return err
 			}
